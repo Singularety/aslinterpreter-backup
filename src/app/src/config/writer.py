@@ -1,7 +1,10 @@
+"""Configuration module for writer."""
+
 import os
 import tomli
 import toml
 from pathlib import Path
+import tempfile
 from core.settings import Settings
 from config.config import DEFAULT_CONFIG
 CONFIG_DIR = Path(__file__).parent
@@ -9,7 +12,6 @@ FILENAME = "config.dev.toml"
 CONFIG_PATH = CONFIG_DIR / FILENAME
 
 
-@staticmethod
 def _merge(default, user):
     result = default.copy()
     for k, v in user.items():
@@ -28,10 +30,12 @@ class ConfigAPI:
 
         return _merge(DEFAULT_CONFIG, userConfig)
 
-    @staticmethod
-    def _write(config: dict):
-        with CONFIG_PATH.open("wb") as f:
+    @classmethod
+    def _write(cls, config):
+        fd, temp_path = tempfile.mkstemp()
+        with open(fd, "w", encoding="utf-8") as f:
             toml.dump(config, f)
+        os.replace(temp_path, CONFIG_PATH)
 
     @classmethod
     def getConfig(cls):

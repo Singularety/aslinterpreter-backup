@@ -1,3 +1,6 @@
+/* Outline: style file used by the ASL interpreter project. */
+/* Styles are grouped by UI area for easier maintenance. */
+
 * {
     margin: 0;
     padding: 0;

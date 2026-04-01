@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Module implementing basemodelmakerexporterscript logic for this project."""
+
 
 import os
 import tensorflow as tf

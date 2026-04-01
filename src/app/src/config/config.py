@@ -1,3 +1,5 @@
+"""Configuration module for config."""
+
 from pathlib import Path
 import tomli
 
@@ -7,16 +9,22 @@ DEFAULT_CONFIG = {
     },
     "app": {
         "name": "Asl to English Translator",
-        "enviornment": "development",
+        "environment": "development",
+        "fullscreen_mode": "Windowed",
         "width": 1280,
         "height": 800,
-        "log_level": 1,
+        "pos_x": 100,
+        "pos_y": 100,
+        "monitor": 0,
+        "dpi_scaling": "true",
+        "camera": "0",
+        "log_level": 1
     },
     "api": {
-        "base_url": "http://localhost:8080",
+        "base_url": "http://localhost:8080"
     },
     "gestures": {
-        "gesture_model": "testing",
+        "gesture_model": "testing"
     },
     "settings": {
         "examples": 5,
@@ -30,9 +38,9 @@ DEFAULT_CONFIG = {
         "autocorrect_threshold": 0.85,
         "word_gap": 1.0,
         "preview_toggle": "true",
-        "confidence_toggle": "true",
+        "confidence_toggle": "true"
     },
     "env": {
-        "hf_token": "",
+        "hf_token": ""
     }
 }

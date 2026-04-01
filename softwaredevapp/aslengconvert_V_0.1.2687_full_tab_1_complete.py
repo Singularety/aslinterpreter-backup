@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Module implementing aslengconvert V 0.1.2687 full tab 1 complete logic for this project."""
+
 #
 #
 # Fuck you script it sucks dick to debug 

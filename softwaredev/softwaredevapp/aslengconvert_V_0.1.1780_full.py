@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Module implementing aslengconvert V 0.1.1780 full logic for this project."""
+
 #from mediapipe_model_maker import gesture_recognizer
 #assert tf.__version__.startswith('2')
 import matplotlib.pyplot as plt

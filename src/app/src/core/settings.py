@@ -1,3 +1,5 @@
+"""Module implementing settings logic for this project."""
+
 from pydantic import BaseModel
 from typing import Optional
 
@@ -7,8 +9,14 @@ class VersionSettings(BaseModel):
 class AppSettings(BaseModel):
     name: str
     environment: str
+    fullscreen_mode: str
     width: int
     height: int
+    pos_x: int
+    pos_y: int
+    monitor: int
+    dpi_scaling: bool
+    camera: int
     log_level: int
 
 class ApiSettings(BaseModel):

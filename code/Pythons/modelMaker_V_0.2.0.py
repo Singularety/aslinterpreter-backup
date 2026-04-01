@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Module implementing modelmaker V 0.2.0 logic for this project."""
+
 import os
 import cv2
 import tkinter as tk

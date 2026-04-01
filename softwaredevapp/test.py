@@ -1,3 +1,5 @@
+"""Module implementing test logic for this project."""
+
 from faster_whisper import WhisperModel
 from pyannote.audio import Pipeline
 import soundcard as sc

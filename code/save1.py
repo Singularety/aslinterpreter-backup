@@ -1,3 +1,5 @@
+"""Module implementing save1 logic for this project."""
+
 import cv2
 import tkinter as tk
 from mediapipe import Image, ImageFormat

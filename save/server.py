@@ -1,3 +1,5 @@
+"""Module implementing server logic for this project."""
+
 from flask import Flask, request, jsonify, render_template
 from faster_whisper import WhisperModel
 from pydub import AudioSegment

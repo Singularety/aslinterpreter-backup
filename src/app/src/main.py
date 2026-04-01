@@ -1,48 +1,68 @@
 #!/usr/bin/env python3
-from config.loader import loadSettings
-from config.loadDefaults import loadDefaultSettings
-from config.writer import ConfigAPI
-from config.config import DEFAULT_CONFIG
-#
-#
-# :3
-#
-#
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
-import matplotlib.pyplot as plt
-from datetime import datetime
+"""
+Main desktop application entrypoint for ASL Interpreter.
+
+This module wires together:
+- App configuration and persistent settings
+- Camera capture and gesture inference (TFLite)
+- Speech transcription (Whisper)
+- PyQt6 UI (translator/model-maker/settings tabs)
+"""
+
+from config.loader import loadSettings  # Load persisted app config at startup.
+from config.loadDefaults import loadDefaultSettings  # Restore config defaults.
+from config.writer import ConfigAPI  # Read/update config values on disk.
+
+# Media + ML stack used by capture, inference, and diagnostics.
+import mediapipe as mp  # Optional hand-landmark visualization helpers.
+import os  # Filesystem utilities and Explorer launch.
+from mediapipe.tasks import python  # MediaPipe task runtime bindings.
+from mediapipe.tasks.python import vision  # Vision task namespace.
+import matplotlib.pyplot as plt  # Dataset sample preview plots.
+from datetime import datetime  # Timestamping logs and captured frames.
+
+# Qt UI stack for widgets, timers, threads, signals, and drawing.
 import PyQt6.QtWidgets as qtw
 import PyQt6.QtCore as qtc
 import PyQt6.QtGui as qtg
-from pathlib import Path
-from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
-import soundcard as sc
-import soundfile as sf
-import numpy as np
-import io
-import threading
-import subprocess
-import json
-import shutil
-import time
-import sys
-import cv2
-from difflib import get_close_matches
-import os 
+
+# General runtime/system dependencies.
+from pathlib import Path  # Cross-platform path handling.
+from faster_whisper import WhisperModel  # Speech-to-text model runtime.
+from pyannote.audio import Pipeline  # Optional diarization pipeline check.
+import soundcard as sc  # Microphone capture backend.
+import soundfile as sf  # Writes temporary WAV buffers for Whisper.
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+import tensorflow as tf  # TFLite interpreter for gesture classification.
+import numpy as np  # Frame/audio tensor operations.
+import io  # In-memory buffer for audio serialization.
+import threading  # Background camera thread + synchronization primitives.
+import subprocess  # Launches training script via WSL.
+import json  # Gesture metadata persistence format.
+import shutil  # Recursive dataset folder deletion.
+import time  # Timing logic for word boundaries and throttles.
+import sys  # QApplication argv/exit plumbing.
+from enum import IntEnum  # Strongly typed log level enum.
+import cv2  # Camera capture + frame preprocessing.
+from difflib import get_close_matches  # Dictionary autocorrect matching.
+
+# -----------------------------------------------------------------------------
+# Global configuration and runtime constants
+# -----------------------------------------------------------------------------
+# Keep absolute path construction centralized so runtime code can use simple
+# constants without worrying about the process working directory.
 CONFIG_FILE = Path(__file__).parent.parent.parent / "app/src/config/config.dev.toml"
 SETTINGS = loadSettings()
 HF_TOKEN = SETTINGS.env.hf_token
 VERSION = SETTINGS.version.version
 SHARED = Path(__file__).parent.parent.parent / "shared"
 DB_FILE = Path(__file__).parent / "gestures.db"
-DATASET_PATH = Path(__file__).parent.parent.parent / "shared/dataset"
+DATASET_PATH = Path(__file__).parent.parent.parent / "shared/datasets"
 EXPORT_PATH = Path(__file__).parent.parent.parent / "shared/exports"
 WORKER_LOG_PATH = Path(__file__).parent.parent.parent / "shared/logs/worker.log.json"
-MODEL_PATH = Path(__file__).parent.parent.parent / "deploy/gestures.task"
+MODEL_PATH = Path(__file__).parent.parent.parent / "deploy/asl_model.tflite"
 WORDLIST = Path(__file__).parent.parent.parent / "deploy/words.txt"
+LABELS_PATH = Path(__file__).parent.parent.parent / "deploy/labels.txt"
 MODEL_NAME = SETTINGS.gestures.gesture_model
 CAMERA_INDEX = 0
 NUM_EXAMPLES = SETTINGS.settings.examples
@@ -62,49 +82,162 @@ AUTOCORRECT_TOGGLE = SETTINGS.settings.autocorrect
 AUTOCORRECT_THRESHOLD = SETTINGS.settings.autocorrect_threshold
 LOG_LEVEL = SETTINGS.app.log_level
 
-class LogLevel:
+# Probe for a usable camera index so UI setup can fail early with a clear error.
+def findWorkingCamera(start_index=0, max_tested=5):
+    """Return first camera index that opens successfully, else None."""
+    # Probe only a small index range for faster startup.
+    for i in range(start_index, max_tested):
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            cap.release()
+            return i
+    return None
+
+class LogLevel(IntEnum):
     DEBUG = 0
     INFO = 1
     WARNING = 2
     ERROR = 3
 
+class WindowMode:
+    WINDOWED = "windowed"
+    FULLSCREEN = "fullscreen"
+    BORDERLESS = "borderless"
+
+class WindowManager:
+    def __init__(self, window, settings):
+        """Store window/settings state used to apply runtime display changes."""
+        self.window = window
+        self.settings = settings
+
+        self.mode = settings.app.fullscreen_mode
+        self.width = settings.app.width
+        self.height = settings.app.height
+        self.monitorIndex = settings.app.monitor
+        self.posx = settings.app.pos_x
+        self.posy = settings.app.pos_y
+        self.dpiScaling = settings.app.dpi_scaling
+
+    def screens(self):
+        """Return Qt-visible monitors."""
+        return qtw.QApplication.screens()
+    
+    def currentScreen(self):
+        """Return selected monitor, clamped to valid range."""
+        screens = self.screens()
+        # Clamp to valid range in case monitor count changed since last run.
+        return screens[min(self.monitorIndex, len(screens)-1)]
+    
+    def availableResolutions(self):
+        """List common resolutions that fit on the selected monitor."""
+        screen = self.currentScreen()
+        size = screen.size()
+        w, h = size.width(), size.height()
+        # Generate common window sizes that fit on the selected monitor.
+        common = [
+            (3840,2160),(2560,1440),(2048,1536),(1920,1440),(1920,1080),
+            (1600,900),(1400,1050),(1280,720),(1280,960),
+            (1024,768),(800,600),(640,480)
+        ]
+        resolutions = sorted([(cw,ch) for cw,ch in common if cw<=w and ch<=h], reverse=True) 
+        return resolutions
+
+    def apply(self, mode=None, width=None, height=None, monitor=None):
+        """Apply mode/size/monitor changes to the main window immediately."""
+        if mode is not None:
+            self.mode = mode
+        if width:
+            self.width = width
+        if height:
+            self.height = height
+        if monitor is not None:
+            self.monitorIndex = monitor
+
+        w = self.window
+        screen = self.currentScreen()
+
+        # Reset to standard window flags before applying target mode.
+        w.showNormal()
+        w.setWindowFlags(qtc.Qt.WindowType.Window)
+        w.move(self.posx, self.posy)
+
+        if self.mode == WindowMode.WINDOWED:
+            w.resize(self.width, self.height)
+            w.move(self.posx, self.posy)
+            w.show()
+
+        elif self.mode == WindowMode.FULLSCREEN:
+            w.windowHandle().setScreen(screen)
+            w.showFullScreen()
+
+        elif self.mode == WindowMode.BORDERLESS:
+            w.setWindowFlags(qtc.Qt.WindowType.FramelessWindowHint)
+            w.windowHandle().setScreen(screen)
+            w.setGeometry(screen.geometry())
+            w.show()
+
+    def saveState(self):
+        """Persist current geometry fields from the live Qt window."""
+        g = self.window.geometry()
+        self.posx = g.x()
+        self.posy = g.y()
+        self.width = g.width()
+        self.height = g.height()
+
+    def applyDPI(self):
+        """Apply high-DPI rounding policy when DPI scaling is enabled."""
+        if self.dpiScaling:
+            qtw.QApplication.setHighDpiScaleFactorRoundingPolicy(
+                qtc.Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+            )
+
 class UILogger(qtc.QObject):
     logReady = qtc.pyqtSignal(str)
-    def __init__(self, name="app"):
+
+    def __init__(self, name="app", level=LogLevel.INFO):
+        """Create a Qt-signal logger that emits formatted log lines."""
         super().__init__()
         self.name = name
+        self.level = level 
 
-    def setLevel(self):
-        self.level = LOG_LEVEL
+    def setLevel(self, level):
+        """Set active minimum log level for this logger."""
+        self.level = level
 
     def log(self, message, level):
-        self.level = level
-        if self.level == 0:
-            self.levelText = "Debug"
-        if self.level == 1:
-            self.levelText = "Info"
-        if self.level == 2:
-            self.levelText = "Warning"
-        if self.level == 3:
-            self.levelText = "Error"
+        """Emit a timestamped log message if level passes the threshold."""
+        # Filter here once so all connected UI sinks receive the same stream.
+        if level < self.level:
+            return
+        if level == LogLevel.DEBUG:
+            levelText = "Debug"
+        elif level == LogLevel.INFO:
+            levelText = "Info"
+        elif level == LogLevel.WARNING:
+            levelText = "Warning"
+        else:
+            levelText = "Error"
         ts = datetime.now().strftime("[%H:%M:%S]")
-        self.logReady.emit(f"{self.levelText} {ts} {message}")
+        self.logReady.emit(f"{levelText} {ts} {message}")
 
 class LogViewer(qtw.QTextEdit):
     def __init__(self, maxLines=1500, parent=None):
+        """Create a buffered text log view with capped history."""
         super().__init__(parent)
         self.setReadOnly(True)
         self.maxLines = maxLines
         self.lines = []
         self.flushTimer = qtc.QTimer(self)
         self.flushTimer.timeout.connect(self.flush)
-        self.flushTimer.start(100)  # 10 FPS UI updates
+        self.flushTimer.start(100)  # Batch log UI updates (10 FPS).
         self.pending = []
 
     def enqueue(self, message):
+        """Queue a log line for batched UI flush."""
         self.pending.append(message)
 
     def flush(self):
+        """Flush pending lines into the widget and trim to max history."""
         if not self.pending:
             return
         self.lines.extend(self.pending)
@@ -114,23 +247,41 @@ class LogViewer(qtw.QTextEdit):
         self.setPlainText("\n".join(self.lines))
         self.verticalScrollBar().setValue(self.verticalScrollBar().maximum())
 
+class WhisperManager:
+    _model = None
+
+    @classmethod
+    def getModel(cls):
+        """Return shared singleton Whisper model instance."""
+        # Lazily load once; Whisper initialization is expensive.
+        if cls._model is None:
+            print("Loading Whisper model...")
+            cls._model = WhisperModel("small", device="cpu", compute_type="int8")
+            print("Model loaded.")
+        return cls._model
+
 class WordDecoder:
     def __init__(self, wordSet):
+        """Track recognized letters and convert them into words over time."""
         self.wordSet = wordSet
         self.buffer = []
         self.lastTime = None
 
     def push(self, letter, timestamp):
+        """Append one letter with an explicit timestamp."""
         self.buffer.append(letter)
         self.lastTime = timestamp
 
     def addLetter(self, letter, t=None):
+        """Append one letter and return current preview text."""
         t = t or time.time()
         self.lastTime = t
         self.buffer.append(letter)
         return " ".join(self.buffer)  # preview
 
     def shouldFlush(self):
+        """Return True when buffered letters should be finalized into a token."""
+        # If enough time passed since last letter, finalize the current token.
         return (
             self.buffer and
             self.lastTime and
@@ -138,15 +289,22 @@ class WordDecoder:
         )
 
     def wordConfidence(self, word, maxLen=12):
+        """Score words higher if valid and sufficiently long."""
         if word not in self.wordSet:
             return 0.0
         return 0.6 + 0.4 * min(len(word) / maxLen, 1.0)
 
     def autocorrect(self, word):
+        """Return nearest dictionary word above fixed similarity cutoff."""
         matches = get_close_matches(word, self.wordSet, n=1, cutoff=0.85)
         return matches[0] if matches else None
 
     def flush(self):
+        """Finalize buffered letters into word/letters output with confidence."""
+        # Output preference:
+        # 1) autocorrected dictionary word
+        # 2) direct dictionary word above threshold
+        # 3) spaced letters fallback when confidence is low
         word = "".join(self.buffer)
         corrected = self.autocorrect(word)
 
@@ -170,12 +328,13 @@ class WhisperWorker(qtc.QThread):
     textReady = qtc.pyqtSignal(str)
     logMessage = qtc.pyqtSignal(str, int)
     def __init__(self, parent=None):
+        """Initialize audio recorder and transcription dependencies."""
         super().__init__(parent)
         self.currentChunkDuration = INITIAL_CHUNK_DURATION
         self.lastText = ""
         self.running = True
         self.mic = sc.default_microphone()
-        self.model = WhisperModel("small", device="cpu", compute_type="int8")
+        self.model = WhisperManager.getModel()
         try:
             Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
         except Exception as e:
@@ -183,9 +342,11 @@ class WhisperWorker(qtc.QThread):
             self.diarization_pipeline = None
 
     def stop(self):
+        """Request the worker loop to stop."""
         self.running = False
 
     def transcribeAudio(self, audio):
+        """Convert numpy audio to WAV buffer and transcribe with Whisper."""
         buffer = io.BytesIO()
         sf.write(buffer, audio, SAMPLE_RATE, format="WAV")
         buffer.seek(0)
@@ -193,18 +354,22 @@ class WhisperWorker(qtc.QThread):
         return "\n".join(seg.text for seg in segments)
 
     def run(self):
+        """Continuously capture microphone audio and emit incremental text."""
         self.logMessage.emit("Loading Whisper model...", LogLevel.INFO)
         recorded = np.zeros((0, 1), dtype=np.float32)
         while self.running:
+            # Capture incrementally and keep a rolling 30s context to reduce resets.
             with self.mic.recorder(samplerate=SAMPLE_RATE, channels=1) as recorder:
                 chunk = recorder.record(numframes=int(self.currentChunkDuration * SAMPLE_RATE))
             recorded = np.concatenate([recorded, chunk], axis=0)
             maxSamples = SAMPLE_RATE * 30
             recorded = recorded[-maxSamples:]
             text = self.transcribeAudio(recorded)
+            # Reduce chunk size gradually for lower latency after warm-up.
             if self.currentChunkDuration > MIN_CHUNK_DURATION:
                 self.currentChunkDuration = max(self.currentChunkDuration - CHUNK_DECREMENT, MIN_CHUNK_DURATION)
             if text != self.lastText:
+                # Emit only newly produced suffix to avoid duplicate text.
                 newText = text[len(self.lastText):].strip()
                 if newText:
                     self.textReady.emit(newText)
@@ -212,6 +377,7 @@ class WhisperWorker(qtc.QThread):
 
 class AspectRatioWidget(qtw.QWidget):
     def __init__(self, ratio=16/9, parent=None):
+        """Display a pixmap while preserving a target aspect ratio."""
         super().__init__(parent)
         self.ratio = ratio
         self.pixmap = None
@@ -226,6 +392,7 @@ class AspectRatioWidget(qtw.QWidget):
         self.layout.addWidget(self.label)
 
     def setPixmap(self, pixmap: qtg.QPixmap):
+        """Store and display incoming pixmap with aspect-preserving scaling."""
         self.pixmap = pixmap
         if pixmap is not None:
             self.label.setPixmap(pixmap.scaled(
@@ -235,6 +402,7 @@ class AspectRatioWidget(qtw.QWidget):
             ))
 
     def resizeEvent(self, event):
+        """Rescale current pixmap whenever widget size changes."""
         if self.pixmap:
             self.label.setPixmap(self.pixmap.scaled(
                 self.label.size(),
@@ -243,6 +411,7 @@ class AspectRatioWidget(qtw.QWidget):
             ))
 
     def paintEvent(self, event):
+        """Draw centered, aspect-correct pixmap with smooth scaling."""
         if not self.pixmap:
             return
         self.painter = qtg.QPainter(self)
@@ -256,56 +425,101 @@ class AspectRatioWidget(qtw.QWidget):
             self.target_w = int(self.target_h * self.ratio)
         self.x = (self.widget_w - self.target_w) // 2
         self.y = (self.widget_h - self.target_h) // 2
-        self.painter.drawPixmap(
-            qtc.QRect(self.x, self.y, self.target_w, self.target_h),
-            self.pixmap
+        scaled = self.pixmap.scaled(
+            self.target_w, self.target_h,
+            qtc.Qt.AspectRatioMode.KeepAspectRatioByExpanding, qtc.Qt.TransformationMode.SmoothTransformation
         )
+        self.painter.drawPixmap(
+            qtc.QRect(self.x, self.y, self.target_w, self.target_h), scaled)
         self.painter.end()
+
 
 class GestureRecognizerWithoutLinesWorker(qtc.QObject):
     gestureRecognized = qtc.pyqtSignal(str, float)
-    def __init__(self, MODEL_PATH: str, parent=None):
+
+    def __init__(self, MODEL_PATH: str, LABEL_PATH: str, parent=None):
+        """Load TFLite gesture model + labels and initialize inference state."""
         super().__init__(parent)
-        self.modelPath = str(MODEL_PATH)
+
+        self.modelPath = MODEL_PATH
+        self.labels = open(LABEL_PATH).read().splitlines()
+
         self.running = False
         self.enabled = True
         self.lastProcessTime = 0.0
         self.minInterval = 0.10
-        self.baseOptions = python.BaseOptions(model_asset_path=str(self.modelPath))
-        self.options = vision.GestureRecognizerOptions(base_options=self.baseOptions, running_mode = vision.RunningMode.VIDEO)
-        self.recognizer = vision.GestureRecognizer.create_from_options(self.options)
+
+        # Load TFLite model
+        self.interpreter = tf.lite.Interpreter(model_path=self.modelPath)
+        self.interpreter.allocate_tensors()
+
+        # Input / Output info
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+
+        self.input_shape = self.input_details[0]["shape"]
+        self.height = self.input_shape[1]
+        self.width = self.input_shape[2]
+
         self.lastGesture = None
-        
+        self.lastEmitTime = 0
+
     @qtc.pyqtSlot(np.ndarray)
     def processFrame(self, frame):
+        """Run throttled inference on a frame and emit recognized gesture."""
         now = time.time()
+
         if not self.enabled:
             return
         if now - self.lastProcessTime < self.minInterval:
             return
         if frame is None:
             return
+
         self.lastProcessTime = now
+
+        # Mirror so on-screen motion feels natural to the user.
         frame = cv2.flip(frame, 1)
-        rgbFrame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mpImage = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgbFrame)
-        timestamp = int(time.time() * 1000)
-        self.result = self.recognizer.recognize_for_video(mpImage, timestamp)
-        if self.result.gestures:
-            top = self.result.gestures[0][0]
-            if top.score > 0.5:
-                if now - self.lastProcessTime > 0.3:
-                    self.lastGesture = top.category_name
-                    self.gestureRecognized.emit(top.category_name, top.score)
+
+        # Match model input contract: size + RGB + float normalization.
+        img = cv2.resize(frame, (self.width, self.height))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32) / 255.0
+        img = np.expand_dims(img, axis=0)
+
+        # Run TFLite inference.
+        self.interpreter.set_tensor(self.input_details[0]["index"], img)
+        self.interpreter.invoke()
+
+        output = self.interpreter.get_tensor(self.output_details[0]["index"])[0]
+
+        # Emit only confident predictions and throttle event spam.
+        idx = int(np.argmax(output))
+        score = float(output[idx])
+        label = self.labels[idx] if idx < len(self.labels) else str(idx)
+
+        if score > 0.5:
+            # Small cooldown prevents near-identical repeats across frames.
+            if now - self.lastEmitTime > 0.3:
+                self.lastEmitTime = now
+                self.lastGesture = label
+                self.gestureRecognized.emit(label, score)
 
 class MainGui(qtw.QMainWindow):
     frameForGesture = qtc.pyqtSignal(np.ndarray)
     def __init__(self):
+        """Build the full GUI, start workers, and initialize camera pipelines."""
         super().__init__()
+        # Window/bootstrap state.
         self.title = SETTINGS.app.name
-        self.width = SETTINGS.app.width
-        self.height = SETTINGS.app.height
         self.setWindowTitle(self.title)
+        self.windowManager = WindowManager(self, SETTINGS)
+        self.windowManager.apply(
+            SETTINGS.app.fullscreen_mode,
+            SETTINGS.app.width,
+            SETTINGS.app.height
+        )
+        self.move(self.windowManager.posx, self.windowManager.posy)
         self.runtimeLogger = UILogger("runtime")
         self.translatorLogger = UILogger("translator")
         self.workerLogger = UILogger("worker")
@@ -314,13 +528,10 @@ class MainGui(qtw.QMainWindow):
             raise FileNotFoundError(f"Word list not found: {WORDLIST}")
         with open(WORDLIST, encoding="utf-8") as f:
             self.wordSet = {line.strip().upper() for line in f if line.strip()}
-        self.words = f
-        self.decoder = WordDecoder(self.words)
+        # Decoder turns streamed letters into final words based on timing.
+        self.decoder = WordDecoder(self.wordSet)
         self.logStatus("Loaded Word List", LogLevel.INFO)
-        self.logStatus(f"Window size: {self.width}x{self.height}", LogLevel.DEBUG)
-        self.resize(self.width, self.height)
-        if self.width <= 0 or self.height <= 0:
-            self.resize(1280, 800)
+        self.logStatus(f"Window size: {self.windowManager.width}x{self.windowManager.height}", LogLevel.DEBUG)
         self.logLevel = LogLevel.INFO
         self.modelDir = Path(DATASET_PATH)
         self.exportDir = Path(EXPORT_PATH)
@@ -329,13 +540,16 @@ class MainGui(qtw.QMainWindow):
         self.exampleAmount = NUM_EXAMPLES
         self.workerLogPath = Path(WORKER_LOG_PATH)
         self.lines = SETTINGS.settings.lines
+        # Run gesture inference in its own Qt thread to keep UI responsive.
         self.gestureThread = qtc.QThread(self)
-        self.signRecognizerNoLines = GestureRecognizerWithoutLinesWorker(MODEL_PATH)
+        self.signRecognizerNoLines = GestureRecognizerWithoutLinesWorker(MODEL_PATH, LABELS_PATH)
         self.logStatus("Loaded Model Detection", LogLevel.INFO)
         self.signRecognizerNoLines.moveToThread(self.gestureThread)
         self.gestureThread.finished.connect(self.signRecognizerNoLines.deleteLater)
         self.gestureThread.start()
         self._logFilePos = 0
+        self.lastWorkerLogLine = 0
+        # Poll worker log file on timer so subprocess output appears live in UI.
         self.workerLogTimer = qtc.QTimer()
         self.workerLogTimer.timeout.connect(self.readWorkerLogs)
         self.workerLogTimer.start(250)
@@ -345,9 +559,9 @@ class MainGui(qtw.QMainWindow):
         self.translatorStatusLayout = qtw.QVBoxLayout()
         self.capturing = False
         self.currentGesture = None
+        self.windowManager.applyDPI()
         os.makedirs(self.modelDir, exist_ok=True)
         self._logFilePos = 0
-        self.workerLogTimer = qtc.QTimer()
         self.workerLogTimer.start(250)
         self.translatorCameraView = AspectRatioWidget(16/9)
         self.cameraView = AspectRatioWidget(16/9)
@@ -358,6 +572,7 @@ class MainGui(qtw.QMainWindow):
         self.centralWid = qtw.QWidget()
         self.centralWid.setLayout(self.outLayout)
         self.setCentralWidget(self.centralWid)
+        # Main tab shell + log panes.
         self.tabs = qtw.QTabWidget()
         self.quitTab = qtw.QWidget()
         self.statusOutput = LogViewer(maxLines=1500)
@@ -370,19 +585,24 @@ class MainGui(qtw.QMainWindow):
         self.tabs.addTab(self.translatorTabUI(), "Translator")
         self.tabs.addTab(self.modelMakerTabUI(), "Model Maker")
         self.tabs.addTab(self.settingsTabUI(), "Settings")
+        for i in self.listAvailableCameras():
+            self.cameraMenu.addItem(f"Camera {i}", i)
         self.tabs.currentChanged.connect(lambda _: self.updateFrame())
         self.outLayout.addWidget(self.tabs, 0)
         self.initCamera()
         self.gestures = self.loadExistingGestures(orderByName=True)
         self.loadExistingGestures(orderByName=True)
+        # Camera loop drives UI refresh at ~30 FPS.
         self.frameTimer = qtc.QTimer()
         self.frameTimer.timeout.connect(self.updateFrame)
         self.frameTimer.start(33)
+        # Speech pipeline updates text asynchronously.
         self.whisperWorker = WhisperWorker()
         self.wordTimer = qtc.QTimer()
         self.wordTimer.timeout.connect(self.checkWordBoundary)
         self.wordTimer.start(200)
         self.whisperWorker.textReady.connect(self.updateTranscription)
+        # Frame handoff to inference runs through a Qt signal for thread safety.
         self.frameForGesture.connect(self.signRecognizerNoLines.processFrame)
         self.letterBuffer = []
         self.lastGestureTime = None
@@ -394,8 +614,11 @@ class MainGui(qtw.QMainWindow):
         if self.cap:
             self.launchCameraThread()
             self.updateFrame()
-
+    
     def translatorTabUI(self):
+        """Construct translator tab UI for live speech/sign outputs."""
+        # This tab surfaces three streams:
+        # microphone transcription, signed-letter decoding, and diagnostic logs.
         self.translatorTab = qtw.QWidget()
         self.translatorTabLayout = qtw.QGridLayout()
         self.scoreTranscriptionOutputLayout = qtw.QVBoxLayout()
@@ -439,8 +662,8 @@ class MainGui(qtw.QMainWindow):
         self.audioOutputTranscriptionLayout.addWidget(self.transcriptionOutput, 1)
         self.scoreTranscriptionOutputLayout.addWidget(self.scoreTranscriptionOutputLabel, 0)
         self.scoreTranscriptionOutputLayout.addWidget(self.scoreTranscriptionOutput, 1)
-        self.translatorTabLayout.addLayout(self.scoreTranscriptionOutputLayout, 0, 2)
-        self.translatorTabLayout.addWidget(self.audioRecordBtn, 0, 1)
+        #self.translatorTabLayout.addLayout(self.scoreTranscriptionOutputLayout, 0, 2)
+        self.translatorTabLayout.addWidget(self.audioRecordBtn, 1, 1)
         self.translatorStatusLayout.addWidget(self.translatorStatusOutputLabel, 0)
         self.translatorStatusLayout.addWidget(self.translatorStatusOutput, 1)
         self.translatorStatusFrame.setLayout(self.translatorStatusLayout)
@@ -451,6 +674,7 @@ class MainGui(qtw.QMainWindow):
         return self.translatorTab
     
     def modelMakerTabUI(self):
+        """Construct model-maker tab for gesture dataset management/training."""
         #
         # Layouts: 
         # modelMakerTabLayout() is the main layout for the tab so it's just the outer ring for the tab 
@@ -493,7 +717,7 @@ class MainGui(qtw.QMainWindow):
         self.versionFolderBtn.clicked.connect(self.openVersionFolder)
         self.quitProgramBtn = qtw.QPushButton("Quit Program")
         self.modelMakerTabLayout.addWidget(self.quitProgramBtn, 0, 5)
-        self.quitProgramBtn.clicked.connect(self.closeProgram)
+        self.quitProgramBtn.clicked.connect(self.closeEvent)
         self.datasetPathLabel = qtw.QLabel(f"Image Storage Path: {DATASET_PATH}\n"
                                            f"Current Model: {self.modelDir}")
         self.datasetPathLabel.setTextInteractionFlags(qtc.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -534,6 +758,7 @@ class MainGui(qtw.QMainWindow):
         return self.modelMakerTab
 
     def autocorrecting(self, word):
+        """Find nearest known word candidate for a recognized token."""
         matches = get_close_matches(
             word,
             self.wordSet,
@@ -543,13 +768,18 @@ class MainGui(qtw.QMainWindow):
         return matches[0] if matches else None
     
     def wordPercentage(self, word, maxLen=8):
+        """Compute a simple confidence heuristic for word completeness."""
         if word not in self.wordSet:
             return 0.0
         lengthScore = min(len(word) / maxLen, 1.0)
         return 0.6 + 0.4 * lengthScore
     
     def checkWordBoundary(self):
+        """Flush buffered ASL letters into finalized words after idle gap."""
         if self.decoder.shouldFlush():
+            # tag values:
+            # auto = autocorrected word, word = accepted raw word,
+            # letters = fallback when confidence is too low.
             text, conf, tag = self.decoder.flush()
             self.aslTranscriptionOutput.append(
                 f"{text} ({tag}, {conf:.2f})"
@@ -557,12 +787,13 @@ class MainGui(qtw.QMainWindow):
             self.aslTranscriptionOutput.setText("…")
     
     def aslmodelshow(self):
+        """Render MediaPipe hand landmarks on the current frame."""
         self.mpHands = mp.solutions.hands
         self.mpDrawing = mp.solutions.drawing_utils
         self.hands = self.mpHands.Hands(
-            max_num_hands=2,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+            max_num_hands=1,
+            min_detection_confidence=0.9,
+            min_tracking_confidence=0.8
         )
         self.frame = cv2.flip(self.frame, 1)
         self.rgbFrame = cv2.cvtColor(self.frame, cv2.COLOR_BGR2RGB)
@@ -573,17 +804,29 @@ class MainGui(qtw.QMainWindow):
         cv2.imshow('Hand Detection', self.frame)
     
     def stopCamera(self):
+        """Stop frame timer and release camera handle if open."""
         self.frameTimer.stop()
         if self.cap and self.cap.isOpened():
             self.cap.release()
 
     def startCamera(self):
+        """Start camera using configured/working index and resume frame timer."""
         if not self.cap or not self.cap.isOpened():
-            self.cap = cv2.VideoCapture(0)
+            preferred = SETTINGS.app.camera
+            working = findWorkingCamera(preferred)
+            if working is None:
+                working = findWorkingCamera(0)
+            if working is None:
+                raise RuntimeError("No working camera detected.")
+            if working != preferred:
+                ConfigAPI.update("app", "camera", working)
+            self.cap = cv2.VideoCapture(working)
         self.frameTimer.start(33)
     
     def onTabChanged(self, index):
+        """Enable camera timer only on tabs that need a live feed."""
         self.widget = self.tabs.widget(index)
+        # Camera is only needed on tabs that render live video.
         if self.widget in (self.translatorTab, self.modelMakerTab):
             if not self.frameTimer.isActive():
                 self.frameTimer.start(33)
@@ -593,18 +836,21 @@ class MainGui(qtw.QMainWindow):
             self.logStatus("Camera Stopped", LogLevel.INFO)
 
     def readWorkerLogs(self):
+        """Read new worker log lines and forward them into UI loggers."""
         try:
             with open(WORKER_LOG_PATH, "r") as f:
+                # Tail behavior: consume only newly appended lines each poll.
                 lines = f.readlines()[self.lastWorkerLogLine:]
                 self.lastWorkerLogLine += len(lines)
             for line in lines:
                 level, msg = self.parseWorkerLogLine(line)
                 self.workerLogger.log(msg, level)
-                self.logStatus(f"Message From Model Training Software: {msg}, {LogLevel}.[level]")
+                self.logStatus(f"Message From Model Training Software: {msg}", level)
         except FileNotFoundError:
             pass
 
     def parseWorkerLogLine(self, line):
+        """Infer log level from worker line prefixes."""
         if "[ERROR]" in line:
             return LogLevel.ERROR, line.strip()
         if "[WARNING]" in line:
@@ -614,6 +860,9 @@ class MainGui(qtw.QMainWindow):
         return LogLevel.INFO, line.strip()
     
     def toggleAudioRecording(self):
+        """Start/stop Whisper transcription worker and update button state."""
+        # Worker thread acts like a toggle; wait() ensures clean stop before
+        # allowing another start.
         if self.whisperWorker.isRunning():
             self.whisperWorker.stop()
             self.whisperWorker.wait()
@@ -624,6 +873,8 @@ class MainGui(qtw.QMainWindow):
             self.audioRecordBtn.setText("Stop Audio Transcription")
         
     def updateTranscription(self, text):
+        """Append timestamped microphone transcription text to UI."""
+        # Append-only cursor update avoids clearing existing transcript history.
         self.ts = datetime.now().strftime("[%H:%M:%S] ")
         self.cursor = self.transcriptionOutput.textCursor()
         self.cursor.movePosition(qtg.QTextCursor.MoveOperation.End)
@@ -633,10 +884,15 @@ class MainGui(qtw.QMainWindow):
 
     @qtc.pyqtSlot(str, float)
     def updateASLTranscription(self, name, score):
+        """Push recognized sign token into decoder and show live preview."""
+        # Live preview is letter stream; final word decision happens by timer.
         preview = self.decoder.addLetter(name)
-        self.previewOutput.setText(preview)     
+        self.aslTranscriptionOutput.setText(preview)     
 
     def scoreTranscription(self, score, name):
+        """Append per-token confidence score in the score pane."""
+        # Keep scoring stream separate from text stream so confidence can be
+        # reviewed independently.
         self.ts = datetime.now().strftime("[%H:%M:%S] ")
         self.cursor = self.scoreTranscriptionOutput.textCursor()
         self.cursor.movePosition(qtg.QTextCursor.MoveOperation.End)
@@ -645,12 +901,15 @@ class MainGui(qtw.QMainWindow):
         self.scoreTranscriptionOutput.ensureCursorVisible()
         
     def gestureNameExistsCheck(self):
+        """Validate gesture-name input before creating a new gesture entry."""
         if self.gestureNameInput.text().strip():
            self.addGesture(self.gestureNameInput.text().strip())
         else:
             self.errorMenu(message="The Gesture Does Not Have a Name.")
 
     def loadData(self):
+        """Load gesture metadata JSON, normalizing legacy schema when needed."""
+        # Legacy safety: normalize old dict schema into the current list schema.
         if not os.path.exists(JSON_FILE):
             return []
         with open(JSON_FILE, "r") as f:
@@ -664,18 +923,21 @@ class MainGui(qtw.QMainWindow):
         return self.data
     
     def saveData(self, data):
+        """Persist gesture metadata list to JSON file."""
         with open(JSON_FILE, "w") as f:
             json.dump(data, f, indent=4)
 
     def countImages(self, directory):
+        """Count image files in a gesture folder."""
         if not os.path.exists(directory):
             return 0
         return sum(1 for file in os.listdir(directory) if file.lower().endswith(IMAGE_EXTENSIONS))
     
     def addGesture(self, name):
+        """Create gesture folder and metadata entry if name is new."""
         self.data = self.loadData()
         if any(self.entry["name"] == name for self.entry in self.data):
-            self.logStatust(f"Entry '{name}' already exists.")
+            self.logStatus(f"Entry '{name}' already exists.")
             return
         self.imageDir = Path(DATASET_PATH) / name
         self.imageDir.mkdir(parents=True, exist_ok=True)
@@ -685,11 +947,13 @@ class MainGui(qtw.QMainWindow):
             "image_count": self.imageCount
         })
         self.saveData(self.data)
+        # Refresh trees immediately so users see new gesture/count.
         self.loadExistingGestures()
         self.gestureNameInput.clear()
         self.logStatus(f"Added '{name}' with {self.imageCount} images.")
 
     def updateAllImageCounts(self):
+        """Recalculate and persist image counts for all gesture entries."""
         self.data = self.loadData()
         for self.entry in self.data:
             self.folder = os.path.join(DATASET_PATH, self.entry["name"])
@@ -698,6 +962,8 @@ class MainGui(qtw.QMainWindow):
         self.logStatus("Image counts updated.", LogLevel.INFO)
     
     def deleteGesture(self, name):
+        """Delete gesture metadata/folder and reset related capture state."""
+        # Pause rendering and camera thread before mutating gesture state/files.
         self.frameTimer.stop()
         self.listGesturesTree.setCurrentItem(None)
         self.gestureTreeInfo.setCurrentItem(None)
@@ -706,6 +972,7 @@ class MainGui(qtw.QMainWindow):
         self.stopEvent.set()
         if self.cameraThread:
             self.cameraThread.join(timeout=0.2)
+        # Remove metadata first, then remove dataset folder from disk.
         self.data = [d for d in self.data if d["name"] != name]
         self.saveData(self.data)
         self.listGesturesTree.blockSignals(True)
@@ -717,10 +984,13 @@ class MainGui(qtw.QMainWindow):
         self.name = None
         self.currentGesture = None
         self.capturing = False
+        # Resume UI loop after state and files are consistent again.
         self.frameTimer.start(33)
         self.loadExistingGestures()
 
     def loadExistingGestures(self, orderByName=True):
+        """Rebuild gesture tree widgets from persisted metadata."""
+        # Tree widgets are rebuilt from JSON each time to avoid stale counts.
         self.listGesturesTree.clear()
         self.gestureTreeInfo.clear()
         self.data = self.loadData()
@@ -739,10 +1009,12 @@ class MainGui(qtw.QMainWindow):
         return self.data
         
     def refreshGestures(self):
+        """Reload gesture trees from disk-backed metadata."""
         self.loadExistingGestures(orderByName=True)
         self.logStatus("Refreshed Gesture Tree", LogLevel.INFO)
 
     def gestureSelectedCheck(self):
+        """Guard delete flow by requiring a selected gesture first."""
         self.item = self.selectedGesture()
         if self.item:
             self.confirmGestureDelete(self.item)
@@ -750,6 +1022,8 @@ class MainGui(qtw.QMainWindow):
             self.errorMenu(message="A Gesture is Not Selected.")
 
     def selectedGesture(self):
+        """Return selected gesture item and sync selection in info tree."""
+        # Keep both trees visually synchronized to the same selected gesture.
         self.item = self.listGesturesTree.currentItem()
         if not self.item:
             return None
@@ -762,6 +1036,7 @@ class MainGui(qtw.QMainWindow):
         return self.item
     
     def confirmGestureDelete(self, item):
+        """Ask for confirmation before deleting the selected gesture."""
         item = self.listGesturesTree.currentItem()
         if not item:
             return
@@ -775,6 +1050,7 @@ class MainGui(qtw.QMainWindow):
         )
         if self.reply == qtw.QMessageBox.StandardButton.Yes:
             self.frameTimer.stop()
+            # Force capture-off before delete to prevent writes to removed dir.
             if self.capturing:
                 self.capturing = False
                 self.startCaptureBtn.setText("Start Capture")
@@ -782,9 +1058,12 @@ class MainGui(qtw.QMainWindow):
             self.frameTimer.start(33)
 
     def startCapture(self):
+        """Convenience handler that delegates to capture toggle logic."""
         self.toggleCapture()
 
     def initCamera(self):
+        """Initialize camera capture object and shared thread primitives."""
+        # Try a few device indexes and keep the first camera that can read frames.
         if hasattr(self, "cap") and self.cap and self.cap.isOpened():
             self.cap = self.cap
         else:
@@ -802,23 +1081,29 @@ class MainGui(qtw.QMainWindow):
             self.cap = None
             return             
         self.cap = self.cap
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         self.logStatus(f"Found Camera {self.cap.isOpened()}", LogLevel.INFO)
+        # Keep capture buffer small to minimize preview/inference lag.
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
+        # Reader thread state shared with the UI refresh timer.
         self.stopEvent = threading.Event()
         self.frameLock = threading.Lock()
         self.frame = None
         self.cameraThread = None
 
     def cameraLoop(self):
+        """Continuously read frames and publish only the newest frame."""
+        # Dedicated capture thread: always keep latest frame in memory.
         while not getattr(self, "stopEvent", threading.Event()).is_set() and self.cap:
-            self.ret, self.frame = self.cap.read()
-            if self.ret:
+            ret, frame = self.cap.read()
+            if ret:
+                # Overwrite previous frame; downstream consumers only need latest.
                 with self.frameLock:
-                    self.frame = self.frame
+                    self.frame = frame
     
     def launchCameraThread(self):
+        """Start background camera reader thread if it is not already running."""
         if getattr(self, "cameraThread", None) and self.cameraThread.is_alive():
             return
         self.stopEvent.clear()
@@ -827,6 +1112,8 @@ class MainGui(qtw.QMainWindow):
         self.logStatus("Camera started", LogLevel.INFO)
 
     def updateFrame(self):
+        """Render current frame, run gesture inference, and save captures."""
+        # Render latest frame into camera widgets and optionally save samples.
         if not hasattr(self, "frameLock"):
             return
         self.frameCopy = None
@@ -846,9 +1133,11 @@ class MainGui(qtw.QMainWindow):
         if self.cameraView.isVisible():
             self.cameraView.setPixmap(self.pixmap)
         if self.translatorCameraView.isVisible():
+            # Inference consumes raw BGR frame copy; UI shows converted pixmap.
             self.frameForGesture.emit(self.frameCopy)
             self.translatorCameraView.setPixmap(self.pixmap)
         if self.capturing and self.currentGesture:
+            # Timestamped filenames prevent collisions during high-speed capture.
             self.gesture = self.currentGesture
             self.gestureDir = self.modelDir / self.gesture
             self.gestureDir.mkdir(parents=True, exist_ok=True)
@@ -857,6 +1146,8 @@ class MainGui(qtw.QMainWindow):
             cv2.imwrite(str(self.filename), self.frameCopy)
 
     def toggleCapture(self):
+        """Toggle dataset image capture for the currently selected gesture."""
+        # Capture mode writes timestamped frames into the selected gesture folder.
         if not self.cap:
             self.errorMenu(message="No camera available.")
             return
@@ -874,6 +1165,7 @@ class MainGui(qtw.QMainWindow):
             os.makedirs(self.gestureDir, exist_ok=True)
             self.logStatus(f"Started Capture for gesture '{self.gesture}'.", LogLevel.INFO)
         else:
+            # Recount on stop so UI reflects files that were just written.
             self.startCaptureBtn.setText("Start Capture")
             self.updateAllImageCounts()
             self.refreshGestures()
@@ -881,6 +1173,8 @@ class MainGui(qtw.QMainWindow):
         self.logStatus(f"Capture {self.state} for '{self.gesture}' gesture", LogLevel.INFO)
 
     def visualizeModel(self):
+        """Preview a fixed number of example images per gesture label."""
+        # Build label list from dataset directories so preview mirrors train data.
         self.logStatus(DATASET_PATH, LogLevel.DEBUG)
         self.labels = []
         for i in os.listdir(DATASET_PATH):
@@ -890,6 +1184,7 @@ class MainGui(qtw.QMainWindow):
         for self.label in self.labels:
             self.labelDir = os.path.join(DATASET_PATH, self.label)
             self.exampleFilenames = os.listdir(self.labelDir)[:NUM_EXAMPLES]
+            # Show a horizontal sample strip per label for quick data sanity checks.
             self.fig, self.axs = plt.subplots(1, NUM_EXAMPLES, figsize=(10,2))
             for i in range(NUM_EXAMPLES):
                 self.axs[i].imshow(plt.imread(os.path.join(self.labelDir, self.exampleFilenames[i])))
@@ -900,30 +1195,23 @@ class MainGui(qtw.QMainWindow):
         return self.labels
     
     def runTraining(self):
-        SHARED.mkdir(exist_ok=True)
-        subprocess.Popen(["docker", "compose", "run", "--rm", "worker"])
-        self.logFile = SHARED / "logs" / "worker.log"
-        self.logFile.parent.mkdir(parents=True, exist_ok=True)
-        self.logFile.write_text("")
-        self._logFilePos = 0
-        self.sharedDataset = SHARED / "dataset" / self.modelDir.name
-        shutil.copytree(self.modelDir, self.sharedDataset, dirs_exist_ok=True)
-        self.job = {"dataset": f"dataset/{self.modelDir.name}", "export": f"exports/{self.exportDir.name}"}
-        with open(SHARED / "job.json", "w") as f:
-            json.dump(self.job, f)
-        subprocess.Popen(["docker", "compose", "build", "--no-cache"], cwd=Path(__file__).parent.parent.parent / "deploy")
-        subprocess.Popen(["docker", "compose", "up"], cwd=Path(__file__).parent.parent.parent / "deploy")
-        self.logStatus("Started Training Your Model", LogLevel.INFO)
+        """Run model-training script through WSL and surface logs to UI."""
+        # Launch training inside WSL so Linux-only deps are isolated from the UI app.
+        command = ["wsl", "python3", "/mnt/c/Users/stellar/Downloads/aslinterpreter/src/shared/scripts/train.py"]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.logStatus(f"Training process exited with code {result.returncode}", LogLevel.ERROR)
+        self.logStatus(f'Training Logs {result.stdout}', LogLevel.INFO)
+        self.logStatus(f'Errors {result.stderr}', LogLevel.ERROR)
 
     def trainExportModel(self):
-        self.runTraining()
-        self.logStatus("Booting Up The Model Maker", LogLevel.INFO)
+        """User-facing wrapper that announces and starts model training."""
+        # Keep this method lightweight so UI button handler stays clear.
+        self.logStatus("Making the model", LogLevel.INFO)
         self.logStatus("This may take anywhere from 30 Seconds to 20 Minutes depending on hardware capabilities and amount of images being trained.", LogLevel.INFO)
-        self.resultCheckTimer = qtc.QTimer()
-        self.resultCheckTimer.timeout.connect(self.checkWorkerResult)
-        self.resultCheckTimer.start(1000)
+        self.runTraining()
 
     def toggleDebugLogging(self, state):
+        """Switch logger verbosity between INFO and DEBUG."""
         if state == qtc.Qt.CheckState.Checked:
             self.runtimeLogger.setLevel(LogLevel.DEBUG)
             self.workerLogger.setLevel(LogLevel.DEBUG)
@@ -934,77 +1222,183 @@ class MainGui(qtw.QMainWindow):
             self.translatorLogger.setLevel(LogLevel.INFO)
             self.workerLogger.setLevel(LogLevel.INFO)
             self.logStatus("Debug logging disabled", LogLevel.INFO)
-
-    def checkWorkerResult(self):
-        self.resultPath = SHARED / "result.json"
-        if not self.resultPath.exists():
-            return
-        with open(self.resultPath) as f:
-            self.result = json.load(f)
-        self.logStatus(f"Final model accuracy: {self.result['accuracy']}", LogLevel.INFO)
-        self.resultCheckTimer.stop()
-        self.workerLogTimer.stop()
-        subprocess.Popen(["docker", "compose", "down", "-v"], cwd=Path(__file__).parent.parent.parent / "deploy")
-
-        """
-        DATASET_PATH = self.modelDir
-        data = mp.gesture_recognizer.Dataset.from_folder(dirname=DATASET_PATH, hparams=mp.gesture_recognizer.HandDataPreprocessingParams())
-        train_data, rest_data = data.split(0.8)
-        validation_data, test_data = rest_data.split(0.5)
-        hparams = mp.gesture_recognizer.HParams(exportDir=self.exportDir / "Exported")
-        options = mp.gesture_recognizer.GestureRecognizerOptions(hparams=hparams)
-        model = mp.gesture_recognizer.GestureRecognizer.create(train_data=train_data, validation_data=validation_data, options=options)
-        loss, acc = model.evaluate(test_data, batch_size=1)
-        self.logStatus(f"Test loss:{loss}, Test accuracy:{acc}")
-        model.export_model()
-        print("Exporting Model")
-        hparams = mp.gesture_recognizer.HParams(learning_rate=0.003, exportDir=self.exportDir / "Final Export")
-        model_options = mp.gesture_recognizer.ModelOptions(dropout_rate=0.2)
-        options = mp.gesture_recognizer.GestureRecognizerOptions(model_options=model_options, hparams=hparams)
-        model_2 = mp.gesture_recognizer.GestureRecognizer.create(train_data=train_data, validation_data=validation_data, options=options)
-        loss, accuracy = model_2.evaluate(test_data)
-        self.logStatus(f"Test loss:{loss}, Test accuracy:{accuracy}")
-        self.logStatus("Model Exported Successfully")
-        print("Model Exported Successfully")
-        """
     
     def openVersionFolder(self):
+        """Open dataset/model directory in file explorer."""
         os.startfile(self.modelDir)
     
     def settingsTabUI(self):
+        """Construct settings tab and wire display/camera/config controls."""
+        # Settings tab centralizes display, camera, and debug controls.
         self.settingsTab = qtw.QWidget()
         self.settingsTabLayout = qtw.QGridLayout()
         self.visualizeModelExamplesInput = qtw.QLineEdit()
-        self.widthInput = qtw.QLineEdit()
         self.resetSettingsButton = qtw.QPushButton()
         self.resetSettingsButton.setText("Reset All Settings Back to Defaults")
         self.visualizeModelExamplesInput.setPlaceholderText("Change Number of Examples Shown When Visualizing the Model: ")
-        self.widthInput.setPlaceholderText("Change the Width of the Main Window: ")
         self.debugCheckbox = qtw.QCheckBox("Enable debug logging")
-        self.settingsTabLayout.addWidget(self.visualizeModelExamplesInput, 0, 0)
-        self.settingsTabLayout.addWidget(self.widthInput, 1, 0)
-        self.settingsTabLayout.addWidget(self.resetSettingsButton, 3, 1)
-        self.settingsTabLayout.addWidget(self.debugCheckbox, 2, 0)
+        self.resolutionMenu = qtw.QComboBox()
+        self.cameraMenu = qtw.QComboBox()
+        self.windowModeMenu = qtw.QComboBox()
+        self.monitorMenu = qtw.QComboBox()
+        self.resolutionLayout = qtw.QVBoxLayout()
+        self.monitorLayout = qtw.QVBoxLayout()
+        self.cameraSettingsLayout = qtw.QVBoxLayout()
+        self.setCameraLabel = qtw.QLabel("Set the Camera You Would Like To Use")
+        self.resolutionLabel = qtw.QLabel("Change Window Size and Aspect Ratio")
+        self.aspectRationScaleLabel = qtw.QLabel("Select Aspect Ratio Scale")
+        self.windowResolutionLabel = qtw.QLabel("Select a Resolution")
+        self.windowModeLabel = qtw.QLabel("Fullscreen?")
+        self.dpiCheck = qtw.QCheckBox("Enable DPI Scaling")
+        self.dpiCheck.setChecked(SETTINGS.app.dpi_scaling)
+        self.cameraSettingsLayout.addWidget(self.setCameraLabel, 0)
+        self.cameraSettingsLayout.addWidget(self.cameraMenu, 1)
+        self.resolutionLayout.addWidget(self.dpiCheck)
+        self.resolutionLayout.addWidget(self.resolutionLabel, 0)
+        self.resolutionLayout.addWidget(self.windowModeLabel, 1)
+        self.resolutionLayout.addWidget(self.windowModeMenu, 2)
+        self.resolutionLayout.addWidget(self.aspectRationScaleLabel, 3)
+        self.aspectRatioScaleMenu = qtw.QComboBox()
+        self.resolutionLayout.addWidget(self.aspectRatioScaleMenu, 4)
+        self.resolutionLayout.addWidget(self.windowResolutionLabel, 5)
+        self.resolutionLayout.addWidget(self.resolutionMenu, 6)
+
+        self.windowModeMenu.setCurrentText(self.windowManager.mode.title())
+        
+        for i, screen in enumerate(qtw.QApplication.screens()):
+            self.monitorMenu.addItem(f"Monitor {i}: {screen.size().width()}x{screen.size().height()}", i)
+
+        self.monitorMenu.currentIndexChanged.connect(self.changeMonitor)
+
+        self.aspectRatioScaleMenu.addItems(["16:9", "4:3"])
+        
+        self.windowModeMenu.addItems([
+            "Windowed",
+            "Fullscreen",
+            "Borderless Fullscreen"
+        ])
+        
+        self.resolutions = {
+            "16:9": [
+                ("3840x2160", 3840, 2160),
+                ("2560x1440", 2560, 1440),
+                ("1920x1080", 1920, 1080),
+                ("1280x720", 1280, 720),
+                ("640x480", 640, 480)
+            ],
+            "4:3": [
+                ("2048x1536", 2048, 1536),
+                ("1920x1440", 1920, 1440),
+                ("1400x1050", 1400, 1050),
+                ("1280x960", 1280, 960),
+                ("1024x768", 1024, 768),
+                ("800x600", 800, 600),
+                ("640x480", 640, 480)
+            ]
+        }
+
+        self.monitorLayout.addWidget(qtw.QLabel("Monitor"), 1)
+        self.monitorLayout.addWidget(self.monitorMenu, 1)
+
+        self.widthInput = None
+        self.heightInput = None
+
+        self.windowModeMenu.currentTextChanged.connect(self.changeWindowMode)
+        self.aspectRatioScaleMenu.currentTextChanged.connect(self.updateWindowResolutions)
+        self.resolutionMenu.currentIndexChanged.connect(self.updateWindowSizeValues)
+
+        self.dpiCheck.stateChanged.connect(self.toggleDPIScaling)
+        self.cameraMenu.currentIndexChanged.connect(lambda: ConfigAPI.update("app","camera", self.cameraMenu.currentData()))
+
+
+        # Prime the resolution menu using the active aspect ratio option.
+        self.updateWindowResolutions(self.aspectRatioScaleMenu.currentText())
+
+        self.settingsTabLayout.addLayout(self.monitorLayout, 0, 0)
+        self.settingsTabLayout.addLayout(self.cameraSettingsLayout, 1, 0)
+        self.settingsTabLayout.addLayout(self.resolutionLayout, 2, 0)
+        self.settingsTabLayout.addWidget(self.debugCheckbox, 3, 0)
+        self.settingsTabLayout.addWidget(self.visualizeModelExamplesInput, 4, 0)
+        self.settingsTabLayout.addWidget(self.resetSettingsButton, 5, 1)
+
         self.debugCheckbox.stateChanged.connect(self.toggleDebugLogging)
         self.resetSettingsButton.pressed.connect(self.confirmResetSettings)
         self.settingsTab.setLayout(self.settingsTabLayout)
-        return self.settingsTab
+        self.monitorMenu.setCurrentIndex(self.windowManager.monitorIndex)
+        #return self.settingsTab
+    
+    def changeMonitor(self,i):
+        """Apply monitor change and refresh valid resolution options."""
+        # Resolution list depends on active monitor dimensions.
+        self.windowManager.apply(monitor=i)
+        self.updateWindowResolutions(self.aspectRatioScaleMenu.currentText())
+    
+    def toggleDPIScaling(self, state):
+        """Toggle DPI scaling flag and apply policy immediately."""
+        # Persisted through WindowManager and applied immediately.
+        self.windowManager.dpiScaling = bool(state)
+        self.windowManager.applyDPI()
+    
+    def updateWindowSizeValues(self):
+        """Apply selected window resolution while in windowed mode."""
+        # Ignore size updates while fullscreen/borderless is active.
+        if self.windowManager.mode != WindowMode.WINDOWED:
+            return
+        data = self.resolutionMenu.currentData()
+        if data:
+            w,h = data
+            self.widthInput = w
+            self.heightInput = h
+            self.windowManager.apply(width=w, height=h)
+    
+    def changeWindowMode(self, text):
+        """Map settings UI label to internal window mode and apply it."""
+        modeMap = {
+            "Windowed": WindowMode.WINDOWED,
+            "Fullscreen": WindowMode.FULLSCREEN,
+            "Borderless Fullscreen": WindowMode.BORDERLESS
+        }
+        self.windowManager.apply(mode=modeMap[text])
+    
+    def updateWindowResolutions(self, aspect):
+        """Populate resolutions filtered by selected aspect ratio."""
+        self.resolutionMenu.clear()
+        for w,h in self.windowManager.availableResolutions():
+            # Keep aspect choices strict so listed options are predictable.
+            if aspect=="16:9" and abs((w/h)-(16/9))>0:
+                continue
+            if aspect=="4:3" and abs((w/h)-(4/3))>0:
+                continue
+            self.resolutionMenu.addItem(f"{w}x{h}", (w,h))
+            
+    def keyPressEvent(self, e):
+        """Exit fullscreen/borderless back to windowed on Escape key."""
+        if e.key()==qtc.Qt.Key.Key_Escape and self.windowManager.mode!=WindowMode.WINDOWED:
+            self.windowManager.apply(mode=WindowMode.WINDOWED)
+
+    def listAvailableCameras(self, max_tested=10):
+        """Return list of camera indexes that open successfully."""
+        cams = []
+        # Enumerate quickly at startup to populate camera selection menu.
+        for i in range(max_tested):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                cams.append(i)
+                cap.release()
+        return cams
     
     def updateSettings(self):
-        #
-        # App Settings
-        #
-        self.newWidth = (self.widthInput)
+        """Collect settings form values and persist them to config file."""
+        # Read current UI values and persist them back to config.
+        # App settings.
+        self.newFullscreenMode = self.windowManager.mode
+        self.newWidth = self.widthInput
         self.newHeight = (self.heightInput)
         self.setLogLevel = (self.logLevelInput)
-        #
-        # Gesture Settings
-        #
+        # Gesture settings.
         self.newGesturesName = self.gestureModelInput
-        #
-        # Control Settings
-        #
-        self.newExampleAmount = int(self.visualizeModelExamplesInput)
+        # Control/transcription settings.
+        self.newExampleAmount = int(self.visualizeModelExamplesInput.text())
         self.newSampleRate = self.sampleRateInput
         self.newInitialChunkDeration = self.initialChunkDerationInput
         self.newMinimumChunkDeration = self.minimumChunkDerationInput
@@ -1016,39 +1410,35 @@ class MainGui(qtw.QMainWindow):
         self.setWordGap = self.setWordGapInput
         self.setPreviewToggle = bool(self.PreviewToggleInput)
         self.setConfidenceToggle = bool(self.ConfidenceToggleInput)
-        #
-        # Updateing the App Settings
-        # 
+        # Writes are intentionally explicit per key to keep config errors local.
+        # Write app settings.
+        ConfigAPI.update("app", "fullscreen_mode", self.newFullscreenMode)
         ConfigAPI.update("app", "width", self.newWidth)
         ConfigAPI.update("app", "height", self.newHeight)
         ConfigAPI.update("app", "log_level", self.setLogLevel)
-        #
-        # Updating the gesture settings
-        #
+        # Write gesture settings.
         ConfigAPI.update("gestures", "gesture_model", self.newGesturesName)
-        #
-        # Updating the control Settings
-        #
+        # Write control settings.
         ConfigAPI.update("settings", "examples", self.newExampleAmount)
         ConfigAPI.update("settings", "sam_rate", self.newSampleRate)
         ConfigAPI.update("settings", "init_chunk_der", self.newInitialChunkDeration)
         ConfigAPI.update("settings", "min_chunk_der", self.newMinimumChunkDeration)
-        ConfigAPI.update("settings", "chunk_dec", )
-        ConfigAPI.update("settings", "lines", )
-        ConfigAPI.update("settings", "confidence_threshold", )
+        ConfigAPI.update("settings", "chunk_dec", self.newChunkDecrement)
+        ConfigAPI.update("settings", "lines", self.linesBool)
+        ConfigAPI.update("settings", "confidence_threshold", self.newConfidenceThreshold)
         ConfigAPI.update("settings", "autocorrect", self.setAutocorrectToggle)
         ConfigAPI.update("settings", "autocorrect_threshold", self.setAutocorrectThreshold)
         ConfigAPI.update("settings", "word_gap", self.setWordGap)
         ConfigAPI.update("settings", "preview_toggle", self.setPreviewToggle)
         ConfigAPI.update("settings", "confidence_toggle", self.setConfidenceToggle)
 
-
     # Don't really know if this is needed as I am pretty sure it calls the settings from the file everytime it is needed.
     def reloadSettings(self):
+        """Placeholder hook for settings reload behavior."""
         SETTINGS
 
-
     def confirmResetSettings(self):
+        """Prompt user before resetting persisted settings to defaults."""
         self.reply = qtw.QMessageBox.question(
             self,
             "Confirm Reset",
@@ -1058,20 +1448,20 @@ class MainGui(qtw.QMainWindow):
         )
         if self.reply == qtw.QMessageBox.StandardButton.Yes:
             loadDefaultSettings()
-
-    
     
     def errorMenu(self, message):
+        """Show a blocking error dialog with the provided message."""
         qtw.QMessageBox.critical(self, "Error: ", message, qtw.QMessageBox.StandardButton.Ok)
     
-
-
     def logStatus(self, message, level=LogLevel.INFO):
-        self.runtimeLogger.log(message, LogLevel.DEBUG)
+        """Broadcast one log message to all UI log panes."""
+        self.runtimeLogger.log(message, level)
         self.translatorLogger.log(message, level)
         self.workerLogger.log(message, level)
-    
-    def closeProgram(self):
+
+    def closeEvent(self, event):
+        """Stop workers, release resources, persist window state, then close."""
+        # Gracefully stop threads/devices before writing final window state.
         if hasattr(self, "stopEvent"):
             self.stopEvent.set()
         if hasattr(self, "cameraThread") and self.cameraThread:
@@ -1084,24 +1474,17 @@ class MainGui(qtw.QMainWindow):
         if hasattr(self, "gestureThread"):
             self.gestureThread.quit()
             self.gestureThread.wait()
-        subprocess.Popen(["docker-compose", "down", "-v"], cwd=Path(__file__).parent.parent.parent / "deploy")
         qtw.QApplication.quit()
+        self.windowManager.saveState()
+        # Persist final geometry/mode so next startup restores the same layout.
+        ConfigAPI.update("app","width", self.windowManager.width)
+        ConfigAPI.update("app","height", self.windowManager.height)
+        ConfigAPI.update("app","pos_x", self.windowManager.posx)
+        ConfigAPI.update("app","pos_y", self.windowManager.posy)
+        ConfigAPI.update("app","fullscreen_mode", self.windowManager.mode)
+        ConfigAPI.update("app","monitor", self.windowManager.monitorIndex)
+        super().closeEvent(event)
 
-def quitProgram(self):
-    if hasattr(self, "stopEvent"):
-        self.stopEvent.set()
-    if hasattr(self, "cameraThread") and self.cameraThread:
-        self.cameraThread.join(timeout=1)
-    if hasattr(self, "cap") and self.cap:
-        self.cap.release()
-    if hasattr(self, "whisperWorker"):
-        self.whisperWorker.stop()
-        self.whisperWorker.wait()
-    if hasattr(self, "gestureThread"):
-        self.gestureThread.quit()
-        self.gestureThread.wait()
-    subprocess.Popen(["docker-compose", "down", "-v"], cwd=Path(__file__).parent.parent.parent / "deploy")
-    qtw.QApplication.quit()
 
 if __name__ == "__main__":
     app = qtw.QApplication(sys.argv)

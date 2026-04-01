@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Module implementing modelmaker V 1.0.0 final logic for this project."""
+
 from tkinter import ttk, messagebox, simpledialog, Label, Entry, StringVar, Frame, Scale, Listbox, HORIZONTAL, filedialog, OptionMenu, IntVar
 #from mediapipe_model_maker import gesture_recognizer
 #assert tf.__version__.startswith('2')

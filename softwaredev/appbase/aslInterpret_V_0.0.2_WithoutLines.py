@@ -1,3 +1,5 @@
+"""Module implementing aslinterpret V 0.0.2 withoutlines logic for this project."""
+
 import cv2
 import mediapipe as mp
 from mediapipe.tasks import python

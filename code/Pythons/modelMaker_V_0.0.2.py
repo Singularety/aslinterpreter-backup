@@ -1,3 +1,5 @@
+"""Module implementing modelmaker V 0.0.2 logic for this project."""
+
 import os
 import re
 import time

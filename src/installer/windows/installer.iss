@@ -1,3 +1,6 @@
+; Outline: installer file used by the ASL interpreter project.
+; Keep these settings/scripts in sync with app runtime expectations.
+
 [Setup]
 AppName=MyApp
 AppVersion=1.0

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Module implementing modelmaker V 1.0.0 final logic for this project."""
+
 import os
 import re
 import cv2
@@ -7,15 +9,15 @@ import time
 import shutil
 import threading
 import tkinter as tk
-import tensorflow as tf
+#import tensorflow as tf
 from pathlib import Path
 import ttkbootstrap as tb
 from datetime import datetime
 from PIL import Image, ImageTk
 import matplotlib.pyplot as plt
-assert tf.__version__.startswith('2')
-from mediapipe_model_maker import gesture_recognizer
-from tkinter import ttk, messagebox, simpledialog, Label, Entry, StringVar, Frame, Scale, Listbox, HORIZONTAL, filedialog, OptionMenu, IntVar
+#assert tf.__version__.startswith('2')
+#from mediapipe_model_maker import gesture_recognizer
+from tkinter import ttk, messagebox, simpledialog, Label, Entry, StringVar,  Frame, Scale, Listbox, HORIZONTAL, filedialog, OptionMenu, IntVar
 DATASET_PATH = Path(r"~\SoftwareDev\SoftwareDev2\gesture_data")
 EXPORT_PATH = Path(r"~SoftwareDev\SoftwareDev2\exported_model")
 DATASET_PATH.mkdir(parents=True, exist_ok=True)
@@ -82,7 +84,7 @@ class GestureApp:
         self.root.bind("<F11>", lambda e: self.root.attributes("-fullscreen", True))
         self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
         self.root.resizable(True, True)
-        self.version_dir = get_next_version_dir(DATASET_PATH)
+        self.version_dir = Path(DATASET_PATH / "version_1")
         self.export_dir = get_next_version_dir_export(EXPORT_PATH)
         self.status_text = StringVar(value=f"Version folder: {self.version_dir}")
         self.dataset_path = DATASET_PATH
@@ -415,24 +417,25 @@ class GestureApp:
             plt.show()
             return labels
     def train_data(self):
-        DATASET_PATH = self.version_dir
-        data = gesture_recognizer.Dataset.from_folder(dirname=DATASET_PATH, hparams=gesture_recognizer.HandDataPreprocessingParams())
-        train_data, rest_data = data.split(0.8)
-        validation_data, test_data = rest_data.split(0.5)
-        hparams = gesture_recognizer.HParams(export_dir=self.export_dir / "Exported")
-        options = gesture_recognizer.GestureRecognizerOptions(hparams=hparams)
-        model = gesture_recognizer.GestureRecognizer.create(train_data=train_data, validation_data=validation_data, options=options)
-        loss, acc = model.evaluate(test_data, batch_size=1)
-        self.log_status(f"Test loss:{loss}, Test accuracy:{acc}")
-        model.export_model()
-        print("Exporting Model")
-        hparams = gesture_recognizer.HParams(learning_rate=0.003, export_dir=self.export_dir / "Final Export")
-        model_options = gesture_recognizer.ModelOptions(dropout_rate=0.2)
-        options = gesture_recognizer.GestureRecognizerOptions(model_options=model_options, hparams=hparams)
-        model_2 = gesture_recognizer.GestureRecognizer.create(train_data=train_data, validation_data=validation_data, options=options)
-        loss, accuracy = model_2.evaluate(test_data)
-        self.log_status(f"Test loss:{loss}, Test accuracy:{accuracy}")
-        print("Model Exported Successfully")
+        print("testing")
+        #DATASET_PATH = self.version_dir
+        #data = gesture_recognizer.Dataset.from_folder(dirname=DATASET_PATH, hparams=gesture_recognizer.HandDataPreprocessingParams())
+        #train_data, rest_data = data.split(0.8)
+        #validation_data, test_data = rest_data.split(0.5)
+        #hparams = gesture_recognizer.HParams(export_dir=self.export_dir / "Exported")
+        #options = gesture_recognizer.GestureRecognizerOptions(hparams=hparams)
+        #model = gesture_recognizer.GestureRecognizer.create(train_data=train_data, validation_data=validation_data, options=options)
+        #loss, acc = model.evaluate(test_data, batch_size=1)
+        #self.log_status(f"Test loss:{loss}, Test accuracy:{acc}")
+        #model.export_model()
+        #print("Exporting Model")
+        #hparams = gesture_recognizer.HParams(learning_rate=0.003, export_dir=self.export_dir / "Final Export")
+        #model_options = gesture_recognizer.ModelOptions(dropout_rate=0.2)
+        #options = gesture_recognizer.GestureRecognizerOptions(model_options=model_options, hparams=hparams)
+        #model_2 = gesture_recognizer.GestureRecognizer.create(train_data=train_data, validation_data=validation_data, options=options)
+        #loss, accuracy = model_2.evaluate(test_data)
+        #self.log_status(f"Test loss:{loss}, Test accuracy:{accuracy}")
+        #print("Model Exported Successfully")
     def log_status(self, message):
         print(message) 
     def on_close(self):

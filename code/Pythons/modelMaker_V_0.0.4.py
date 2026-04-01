@@ -1,3 +1,5 @@
+"""Module implementing modelmaker V 0.0.4 logic for this project."""
+
 from IPython.display import display, Javascript, Image
 from google.colab.output import eval_js
 from base64 import b64decode

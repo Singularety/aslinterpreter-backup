@@ -1,3 +1,5 @@
+"""Module implementing testinggesturerecognitionfromimage logic for this project."""
+
 # gesture_gui_trainer_stable.py
 import os
 import cv2

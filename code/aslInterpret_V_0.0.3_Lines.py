@@ -1,3 +1,5 @@
+"""Module implementing aslinterpret V 0.0.3 lines logic for this project."""
+
 import cv2
 import mediapipe as mp
 

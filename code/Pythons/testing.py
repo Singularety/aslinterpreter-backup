@@ -1,3 +1,5 @@
+"""Module implementing testing logic for this project."""
+
 from IPython.display import display, Javascript, Image
 from google.colab.output import eval_js
 from base64 import b64decode

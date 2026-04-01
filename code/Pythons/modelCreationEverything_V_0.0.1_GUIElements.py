@@ -1,3 +1,5 @@
+"""Module implementing modelcreationeverything V 0.0.1 guielements logic for this project."""
+
 import os
 import re
 import time

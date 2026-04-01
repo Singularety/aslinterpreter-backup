@@ -1,3 +1,5 @@
+"""Module implementing modelmaker V 0.0.5 logic for this project."""
+
 # gesture_gui_trainer_stable.py
 import os
 import cv2

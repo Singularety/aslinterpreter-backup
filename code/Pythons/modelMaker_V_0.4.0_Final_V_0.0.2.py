@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+"""Module implementing modelmaker V 0.4.0 final V 0.0.2 logic for this project."""
+
 import os
 import cv2
 import random

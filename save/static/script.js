@@ -1,3 +1,6 @@
+// Outline: script file used by the ASL interpreter project.
+// Inline notes are kept close to behavior-critical logic below.
+
 let mediaRecorder;
 let isRecording = false;
 let sessionId = null;
